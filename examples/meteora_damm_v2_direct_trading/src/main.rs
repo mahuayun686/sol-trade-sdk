@@ -1,7 +1,13 @@
 use sol_trade_sdk::{
-    SolanaTrade, TradeTokenType, common::{
-        AnyResult, TradeConfig, fast_fn::get_associated_token_address_with_program_id_fast_use_seed
-    }, swqos::SwqosConfig, trading::{core::params::{MeteoraDammV2Params, DexParamEnum}, factory::DexType}
+    common::{
+        fast_fn::get_associated_token_address_with_program_id_fast_use_seed, AnyResult, TradeConfig,
+    },
+    swqos::SwqosConfig,
+    trading::{
+        core::params::{DexParamEnum, MeteoraDammV2Params},
+        factory::DexType,
+    },
+    SolanaTrade, TradeTokenType,
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::signature::Keypair;
@@ -32,10 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::MeteoraDammV2(
-            MeteoraDammV2Params::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?,
+            MeteoraDammV2Params::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool)
+                .await?,
         ),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: false, //if input token is SOL/WSOL,set to true,if input token is USDC,set to false.
         close_input_token_ata: false, //if input token is SOL/WSOL,set to true,if input token is USDC,set to false.
         create_mint_ata: true,
@@ -54,7 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = client.infrastructure.rpc.clone();
     let payer = client.payer.pubkey();
     let program_id = sol_trade_sdk::constants::TOKEN_PROGRAM;
-    let account = get_associated_token_address_with_program_id_fast_use_seed(&payer, &mint_pubkey, &program_id, client.use_seed_optimize);
+    let account = get_associated_token_address_with_program_id_fast_use_seed(
+        &payer,
+        &mint_pubkey,
+        &program_id,
+        client.use_seed_optimize,
+    );
     let balance = rpc.get_token_account_balance(&account).await?;
     let amount_token = balance.amount.parse::<u64>().unwrap();
     println!("Token balance: {}", amount_token);
@@ -67,10 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recent_blockhash: Some(recent_blockhash),
         with_tip: false,
         extension_params: DexParamEnum::MeteoraDammV2(
-            MeteoraDammV2Params::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?,
+            MeteoraDammV2Params::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool)
+                .await?,
         ),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: false, //if output token is SOL/WSOL,set to true,if output token is USDC,set to false.
         close_output_token_ata: false, //if output token is SOL/WSOL,set to true,if output token is USDC,set to false.
         close_mint_token_ata: false,
@@ -94,7 +107,14 @@ async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)

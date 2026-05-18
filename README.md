@@ -39,6 +39,12 @@
     <a href="https://discord.gg/vuazbGkqQE">Discord</a>
 </p>
 
+> ☕ **Support This Project**
+>
+> This SDK is completely free and open source. However, maintaining and continuously updating it requires significant AI computing resources and token consumption. If this SDK helps with your trading development, consider making a monthly SOL donation — any amount is appreciated and helps keep this project alive!
+>
+> **Donation Wallet:** `6oW7AXz1yRb57pYSxysuXnMs2aR1ha5rzGzReZ1MjPV8`
+
 ## 📋 Table of Contents
 
 - [✨ Features](#-features)
@@ -48,10 +54,12 @@
   - [⚡ Trading Parameters](#-trading-parameters)
   - [📊 Usage Examples Summary Table](#-usage-examples-summary-table)
   - [⚙️ SWQoS Service Configuration](#️-swqos-service-configuration)
+  - [Astralane (Binary / Plain / QUIC)](#astralane-binary--plain--quic)
   - [🔧 Middleware System](#-middleware-system)
   - [🔍 Address Lookup Tables](#-address-lookup-tables)
   - [🔍 Nonce Cache](#-nonce-cache)
 - [💰 Cashback Support (PumpFun / PumpSwap)](#-cashback-support-pumpfun--pumpswap)
+- [🔄 PumpFun V1 vs V2 Instructions](#-pumpfun-v1-vs-v2-instructions)
 - [🛡️ MEV Protection Services](#️-mev-protection-services)
 - [📁 Project Structure](#-project-structure)
 - [📄 License](#-license)
@@ -60,9 +68,20 @@
 
 ---
 
+## 📦 SDK Versions
+
+This SDK is available in multiple languages:
+
+| Language | Repository | Description |
+|----------|------------|-------------|
+| **Rust** | [sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk) | Ultra-low latency with zero-copy optimization |
+| **Node.js** | [sol-trade-sdk-nodejs](https://github.com/0xfnzero/sol-trade-sdk-nodejs) | TypeScript/JavaScript for Node.js |
+| **Python** | [sol-trade-sdk-python](https://github.com/0xfnzero/sol-trade-sdk-python) | Async/await native support |
+| **Go** | [sol-trade-sdk-golang](https://github.com/0xfnzero/sol-trade-sdk-golang) | Concurrent-safe with goroutine support |
+
 ## ✨ Features
 
-1. **PumpFun Trading**: Support for `buy` and `sell` operations
+1. **PumpFun Trading**: Support for `buy`, `sell`, `buy_exact_sol_in`, and the new unified `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` instructions (SOL + USDC)
 2. **PumpSwap Trading**: Support for PumpSwap pool trading operations
 3. **Bonk Trading**: Support for Bonk trading operations
 4. **Raydium CPMM Trading**: Support for Raydium CPMM (Concentrated Pool Market Maker) trading operations
@@ -89,14 +108,14 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "3.5.7" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.9" }
 ```
 
 ### Use crates.io
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = "3.5.7"
+sol-trade-sdk = "4.0.9"
 ```
 
 ## 🛠️ Usage Examples
@@ -118,14 +137,23 @@ let commitment = CommitmentConfig::processed();
 let swqos_configs: Vec<SwqosConfig> = vec![
     SwqosConfig::Default(rpc_url.clone()),
     SwqosConfig::Jito("your uuid".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Bloxroute("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::Temporal("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::FlashBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::BlockRazor("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    // Astralane: 4th param = AstralaneTransport — Binary (default), Plain (/iris), or Quic
+    SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None), // Binary HTTP /irisb
+    SwqosConfig::SpeedLanding("your api_token".to_string(), SwqosRegion::Frankfurt, None),
 ];
 // Create TradeConfig instance
-let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
-
-// Optional: customize WSOL ATA and seed optimization
-// let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment)
-//     .with_wsol_ata_config(true, true);  // create_wsol_ata_on_startup, use_seed_optimize
+let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+    // .create_wsol_ata_on_startup(true)  // default: true  - check & create WSOL ATA on init
+    // .use_seed_optimize(true)            // default: true  - seed optimization for ATA ops
+    // .log_enabled(true)                  // default: true  - SDK timing / SWQOS logs
+    // .check_min_tip(false)               // default: false - filter SWQOS below min tip
+    // .swqos_cores_from_end(false)        // default: false - bind SWQOS to last N CPU cores
+    // .mev_protection(false)              // default: false - MEV (Astralane QUIC :9000 or HTTP mev-protect / BlockRazor)
+    // .use_pumpfun_v2(false)             // default: false - V1 (18 accounts); set true for V2 (27 accounts, quote_mint) when PumpFun deploys V2
+    .build();
 
 // Create TradingClient
 let client = TradingClient::new(Arc::new(payer), trade_config).await;
@@ -243,7 +271,7 @@ let jito_config = SwqosConfig::Jito(
 );
 
 // Using default regional endpoint (third parameter is None)
-let bloxroute_config = SwqosConfig::Bloxroute(
+let temporal_config = SwqosConfig::Temporal(
     "your_api_token".to_string(),
     SwqosRegion::NewYork, // Will use the default endpoint for this region
     None // No custom URL, uses SwqosRegion
@@ -256,6 +284,29 @@ let bloxroute_config = SwqosConfig::Bloxroute(
 - This allows for maximum flexibility while maintaining backward compatibility 
 
 When using multiple MEV services, you need to use `Durable Nonce`. You need to use the `fetch_nonce_info` function to get the latest `nonce` value, and use it as the `durable_nonce` when trading.
+
+#### Astralane (Binary / Plain HTTP / QUIC)
+
+Astralane supports **Binary** HTTP (`/irisb`), **Plain** HTTP (`/iris`), and **QUIC** (`host:7000`, or `:9000` when global `mev_protection` is true). Pass `Some(AstralaneTransport::Plain)`, `Some(AstralaneTransport::Quic)`, or use `None` / omit for **Binary** (default). Global `mev_protection` adds `mev-protect=true` on HTTP or selects QUIC port 9000.
+
+```rust
+use sol_trade_sdk::{SwqosConfig, SwqosRegion, AstralaneTransport};
+
+let swqos_configs: Vec<SwqosConfig> = vec![
+    SwqosConfig::Default(rpc_url.clone()),
+    SwqosConfig::Astralane(
+        "your_astralane_api_key".to_string(),
+        SwqosRegion::Frankfurt,
+        None,
+        Some(AstralaneTransport::Quic),
+    ),
+];
+// Then create TradeConfig / TradingClient as usual with swqos_configs
+```
+
+- **Binary** (default): `None` or `Some(AstralaneTransport::Binary)` — `/irisb`, bincode body.
+- **Plain**: `Some(AstralaneTransport::Plain)` — `/iris`.
+- **QUIC**: `Some(AstralaneTransport::Quic)` — regional `host:7000` / `:9000` (MEV); same API key.
 
 ---
 
@@ -289,18 +340,84 @@ PumpFun and PumpSwap support **cashback** for eligible tokens: part of the tradi
 - The **pumpfun_copy_trading** and **pumpfun_sniper_trading** examples use sol-parser-sdk for gRPC subscription and pass `e.is_cashback_coin` when building params.
 - **Claim**: Use `client.claim_cashback_pumpfun()` and `client.claim_cashback_pumpswap(...)` to claim accumulated cashback.
 
+#### PumpFun: troubleshooting (on-chain errors)
+
+For **Anchor 2006 / `NotAuthorized` (6000) / wrong token program / BuyZeroAmount (6020) / slippage (6042)** and related issues, see **[docs/PUMP_ERRORS_AND_TROUBLESHOOTING_CN.md](docs/PUMP_ERRORS_AND_TROUBLESHOOTING_CN.md)** (Chinese). An English appendix may be added later.
+
+#### PumpFun: Creator Rewards Sharing (creator_vault)
+
+Some PumpFun coins use **Creator Rewards Sharing**, so the on-chain `creator_vault` can differ from the default derivation. If you reuse cached params from a **buy** when **selling**, you may see program error **2006 (seeds constraint violated)**. To avoid this:
+
+- **From gRPC/events (no RPC needed)**: You can get both `creator` and `creator_vault` from parsed transaction events:
+  - **sol-parser-sdk**: Before pushing events, the pipeline calls `fill_trade_accounts`, which fills `creator_vault` from the buy/sell instruction accounts (buy index 9, sell index 8). `creator` comes from the TradeEvent log. Use `PumpFunParams::from_trade(..., e.creator, e.creator_vault, ...)` or `from_dev_trade(..., e.creator, e.creator_vault, ...)` with the event `e`.
+  - **solana-streamer**: Instruction parsers set `creator_vault` from accounts[9] (buy) or accounts[8] (sell); `creator` comes from the merged CPI TradeEvent log. Use the same `from_trade` / `from_dev_trade` with `e.creator` and `e.creator_vault`.
+- **Override after RPC**: If you get params via `PumpFunParams::from_mint_by_rpc` but later receive a newer `creator_vault` from gRPC, call `.with_creator_vault(latest_creator_vault)` on the params before selling.
+
+The SDK does not fetch creator_vault from RPC on every sell (to avoid latency); pass the up-to-date vault from gRPC/events when available.
+
+#### PumpFun V1 vs V2 Instructions
+
+PumpFun has two instruction sets for bonding-curve trading:
+
+| | V1 (default) | V2 (opt-in) |
+|---|---|---|
+| Instructions | `buy` / `buy_exact_sol_in` / `sell` | `buy_v2` / `buy_exact_quote_in_v2` / `sell_v2` |
+| Account metas | 18 | 27 |
+| Quote mint | SOL only (legacy) | SOL or USDC (via `quote_mint` field) |
+| Transaction size | Smaller (fits `PACKET_DATA_SIZE` without LUT) | Larger (requires LUT for most transactions) |
+
+**Default: V1** (`use_pumpfun_v2 = false`). The SDK uses V1 instructions which produce smaller transactions that fit within the 1232-byte `PACKET_DATA_SIZE` limit without requiring an Address Lookup Table.
+
+**Key changes in v2 instructions:**
+- `quote_mint` parameter — pass wrapped SOL for SOL-paired, or USDC mint for USDC-paired
+- 27 fixed accounts (buy) / 26 fixed accounts (sell) — **no optional accounts**
+- `buyback_fee_recipient`, `sharing_config`, and 6 `associated_quote_*` ATAs are now mandatory
+- Same pricing and cost as legacy instructions for SOL-paired coins
+
+**How to enable V2:**
+
+**Method 1 — Global runtime flag** (recommended when PumpFun officially deploys V2 on mainnet):
+
+```rust
+let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+    .use_pumpfun_v2(true)  // Switch all PumpFun trades to V2 instructions (27 accounts)
+    .build();
+```
+
+**Method 2 — Per-trade via `quote_mint`** (for USDC-paired coins or mixed V1/V2 scenarios):
+
+```rust
+use sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+use sol_trade_sdk::constants::USDC_TOKEN_ACCOUNT;
+
+// SOL-paired coin with v2 layout
+let params = PumpFunParams::from_trade(/* ... */)
+    .with_quote_mint(WSOL_TOKEN_ACCOUNT);
+
+// USDC-paired coin (requires v2)
+let params = PumpFunParams::from_trade(/* ... */)
+    .with_quote_mint(USDC_TOKEN_ACCOUNT);
+```
+
+> **Note**: V2 transactions with ATA creation + durable nonce may exceed `PACKET_DATA_SIZE`. Enable an Address Lookup Table (`address_lookup_table_account`) when using V2.
+
+#### PumpSwap: coin_creator_vault from events (no RPC)
+
+For **PumpSwap** (Pump AMM), `coin_creator_vault_ata` and `coin_creator_vault_authority` are required in buy/sell instructions. Both are available from parsed events without RPC:
+
+- **sol-parser-sdk**: Instruction parser sets them from accounts 17 and 18; the account filler also fills them when the event comes from logs. Use `PumpSwapParams::from_trade(..., e.coin_creator_vault_ata, e.coin_creator_vault_authority, ...)` with the buy/sell event `e`.
+- **solana-streamer**: Instruction parser sets them from `accounts.get(17)` and `accounts.get(18)`. Use the same `from_trade` with the event's `coin_creator_vault_ata` and `coin_creator_vault_authority`.
+
 ## 🛡️ MEV Protection Services
 
 You can apply for a key through the official website: [Community Website](https://fnzero.dev/swqos)
 
 - **Jito**: High-performance block space
-- **ZeroSlot**: Zero-latency transactions
 - **Temporal**: Time-sensitive transactions
-- **Bloxroute**: Blockchain network acceleration
-- **FlashBlock**: High-speed transaction execution with API key authentication - [Official Documentation](https://doc.flashblock.trade/)
-- **BlockRazor**: High-speed transaction execution with API key authentication - [Official Documentation](https://blockrazor.gitbook.io/blockrazor/)
-- **Node1**: High-speed transaction execution with API key authentication - [Official Documentation](https://node1.me/docs.html) 
-- **Astralane**: Blockchain network acceleration
+- **FlashBlock**: High-speed transaction execution with API key authentication
+- **BlockRazor**: High-speed transaction execution with API key authentication
+- **Astralane**: Blockchain network acceleration (Binary/Plain HTTP and QUIC)
+- **SpeedLanding**: High-speed transaction execution with API key authentication
 
 ## 📁 Project Structure
 

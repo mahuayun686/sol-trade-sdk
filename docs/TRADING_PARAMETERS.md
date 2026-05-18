@@ -30,12 +30,12 @@ The `TradeBuyParams` struct contains all parameters required for executing buy o
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `address_lookup_table_account` | `Option<AddressLookupTableAccount>` | ❌ | Address lookup table for transaction optimization |
-| `wait_transaction_confirmed` | `bool` | ✅ | Whether to wait for transaction confirmation |
+| `wait_tx_confirmed` | `bool` | ✅ | Whether to wait for transaction confirmation |
 | `create_input_token_ata` | `bool` | ✅ | Whether to create input token Associated Token Account |
 | `close_input_token_ata` | `bool` | ✅ | Whether to close input token ATA after transaction |
 | `create_mint_ata` | `bool` | ✅ | Whether to create token mint ATA |
 | `durable_nonce` | `Option<DurableNonceInfo>` | ❌ | Durable nonce information containing nonce account and current nonce value |
-| `fixed_output_token_amount` | `Option<u64>` | ❌ | Optional fixed output token amount. If set, this value will be directly assigned to the output amount instead of being calculated (required for Meteora DAMM V2) |
+| `fixed_output_token_amount` | `Option<u64>` | ❌ | Optional fixed output token amount. On exact-out capable DEXes, this uses the exact-out instruction and treats input_token_amount as the max input budget (required for Meteora DAMM V2) |
 | `gas_fee_strategy` | `GasFeeStrategy` | ✅ | Gas fee strategy instance for controlling transaction fees and priorities |
 | `simulate` | `bool` | ✅ | Whether to simulate the transaction instead of executing it. When true, the transaction will be simulated via RPC to validate and show detailed logs, compute units consumed, and potential errors without actually submitting to the blockchain |
 
@@ -62,12 +62,12 @@ The `TradeSellParams` struct contains all parameters required for executing sell
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `address_lookup_table_account` | `Option<Pubkey>` | ❌ | Address lookup table for transaction optimization |
-| `wait_transaction_confirmed` | `bool` | ✅ | Whether to wait for transaction confirmation |
+| `wait_tx_confirmed` | `bool` | ✅ | Whether to wait for transaction confirmation |
 | `create_output_token_ata` | `bool` | ✅ | Whether to create output token Associated Token Account |
 | `close_output_token_ata` | `bool` | ✅ | Whether to close output token ATA after transaction |
 | `durable_nonce` | `Option<DurableNonceInfo>` | ❌ | Durable nonce information containing nonce account and current nonce value |
 | `gas_fee_strategy` | `GasFeeStrategy` | ✅ | Gas fee strategy instance for controlling transaction fees and priorities |
-| `fixed_output_token_amount` | `Option<u64>` | ❌ | Optional fixed output token amount. If set, this value will be directly assigned to the output amount instead of being calculated (required for Meteora DAMM V2) |
+| `fixed_output_token_amount` | `Option<u64>` | ❌ | Optional fixed output token amount. On exact-out capable DEXes, this uses the exact-out instruction and treats input_token_amount as the max input budget (required for Meteora DAMM V2) |
 | `simulate` | `bool` | ✅ | Whether to simulate the transaction instead of executing it. When true, the transaction will be simulated via RPC to validate and show detailed logs, compute units consumed, and potential errors without actually submitting to the blockchain |
 
 
@@ -88,7 +88,7 @@ These parameters are essential for defining the basic trading operation:
 These parameters control how the transaction is processed:
 
 - **slippage_basis_points**: Controls acceptable price slippage
-- **wait_transaction_confirmed**: Controls whether to wait for confirmation
+- **wait_tx_confirmed**: Controls whether to wait for confirmation
 
 ### 🔧 Account Management Parameters
 

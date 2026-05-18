@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::SolanaRpcClient;
-use crate::constants::swqos::{HELIUS_TIP_ACCOUNTS, SWQOS_MIN_TIP_HELIUS, SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY};
+use crate::constants::swqos::{
+    HELIUS_TIP_ACCOUNTS, SWQOS_MIN_TIP_HELIUS, SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY,
+};
 use crate::swqos::{SwqosClientTrait, SwqosType, TradeType};
 
 #[derive(Clone)]
@@ -43,12 +45,7 @@ impl HeliusClient {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().build().unwrap();
         let submit_url = Self::build_submit_url(&endpoint, api_key.as_deref(), swqos_only);
-        Self {
-            submit_url,
-            rpc_client: Arc::new(rpc_client),
-            http_client,
-            swqos_only,
-        }
+        Self { submit_url, rpc_client: Arc::new(rpc_client), http_client, swqos_only }
     }
 
     /// Build URL once at construction; no per-request allocation.
@@ -109,8 +106,11 @@ impl HeliusClient {
         if !status.is_success() {
             if crate::common::sdk_log::sdk_log_enabled() {
                 eprintln!(
-                    " [helius] {} submission failed status={} body={}",
-                    trade_type, status, response_text
+                    " [helius] {} submission failed after {:?} status={} body={}",
+                    trade_type,
+                    start_time.elapsed(),
+                    status,
+                    response_text
                 );
             }
             return Err(anyhow::anyhow!(
@@ -127,21 +127,28 @@ impl HeliusClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(" [helius] {} submission error: {}", trade_type, err_msg);
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "helius",
+                        trade_type,
+                        start_time.elapsed(),
+                        err_msg,
+                    );
                 }
                 return Err(anyhow::anyhow!("Helius Sender error: {}", err_msg));
             }
             if response_json.get("result").is_some() && crate::common::sdk_log::sdk_log_enabled() {
-                println!(
-                    " [helius] {} submitted: {:?}",
+                crate::common::sdk_log::log_swqos_submitted(
+                    "helius",
                     trade_type,
-                    start_time.elapsed()
+                    start_time.elapsed(),
                 );
             }
         } else if crate::common::sdk_log::sdk_log_enabled() {
-            eprintln!(
-                " [helius] {} submission failed: {:?}",
-                trade_type, response_text
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "helius",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
             );
         }
 
@@ -150,23 +157,24 @@ impl HeliusClient {
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
                     eprintln!(
-                        " [helius] {} confirmation failed: {:?}",
+                        " [{:width$}] {} confirmation failed: {:?}",
+                        "helius",
                         trade_type,
-                        start_time.elapsed()
+                        start_time.elapsed(),
+                        width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
                     );
                 }
                 return Err(e);
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            println!(" signature: {:?}", signature);
             println!(
-                " signature: {:?}",
-                signature
-            );
-            println!(
-                " [helius] {} confirmed: {:?}",
+                " [{:width$}] {} confirmed: {:?}",
+                "helius",
                 trade_type,
-                start_time.elapsed()
+                start_time.elapsed(),
+                width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
             );
         }
         Ok(())
@@ -191,8 +199,7 @@ impl SwqosClientTrait for HeliusClient {
         wait_confirmation: bool,
     ) -> Result<()> {
         for transaction in transactions {
-            self.send_transaction(trade_type, transaction, wait_confirmation)
-                .await?;
+            self.send_transaction(trade_type, transaction, wait_confirmation).await?;
         }
         Ok(())
     }

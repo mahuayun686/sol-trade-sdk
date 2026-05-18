@@ -1,11 +1,14 @@
 use sol_trade_sdk::common::fast_fn::get_associated_token_address_with_program_id_fast_use_seed;
 use sol_trade_sdk::common::TradeConfig;
-use sol_trade_sdk::TradeTokenType;
 use sol_trade_sdk::instruction::utils::pumpswap::fetch_pool;
+use sol_trade_sdk::TradeTokenType;
 use sol_trade_sdk::{
     common::AnyResult,
     swqos::SwqosConfig,
-    trading::{core::params::{PumpSwapParams, DexParamEnum}, factory::DexType},
+    trading::{
+        core::params::{DexParamEnum, PumpSwapParams},
+        factory::DexType,
+    },
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -130,7 +133,14 @@ async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)
@@ -152,7 +162,9 @@ async fn pumpswap_trade_with_grpc_buy_event(trade_info: PumpSwapBuyEvent) -> Any
         trade_info.base_token_program,
         trade_info.quote_token_program,
         trade_info.protocol_fee_recipient,
+        pool_data.coin_creator,
         pool_data.is_cashback_coin,
+        0,
     );
     let mint = if trade_info.base_mint == sol_trade_sdk::constants::USDC_TOKEN_ACCOUNT
         || trade_info.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT
@@ -181,7 +193,9 @@ async fn pumpswap_trade_with_grpc_sell_event(trade_info: PumpSwapSellEvent) -> A
         trade_info.base_token_program,
         trade_info.quote_token_program,
         trade_info.protocol_fee_recipient,
+        pool_data.coin_creator,
         pool_data.is_cashback_coin,
+        0,
     );
     let mint = if trade_info.base_mint == sol_trade_sdk::constants::USDC_TOKEN_ACCOUNT
         || trade_info.base_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT
@@ -221,7 +235,7 @@ async fn pumpswap_trade_with_grpc(
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::PumpSwap(params.clone()),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: is_sol,
         close_input_token_ata: is_sol,
         create_mint_ata: true,
@@ -244,7 +258,12 @@ async fn pumpswap_trade_with_grpc(
     } else {
         params.quote_token_program
     };
-    let account = get_associated_token_address_with_program_id_fast_use_seed(&payer, &mint_pubkey, &program_id, client.use_seed_optimize);
+    let account = get_associated_token_address_with_program_id_fast_use_seed(
+        &payer,
+        &mint_pubkey,
+        &program_id,
+        client.use_seed_optimize,
+    );
     let balance = rpc.get_token_account_balance(&account).await?;
     let amount_token = balance.amount.parse::<u64>().unwrap();
     let sell_params = sol_trade_sdk::TradeSellParams {
@@ -257,7 +276,7 @@ async fn pumpswap_trade_with_grpc(
         with_tip: false,
         extension_params: DexParamEnum::PumpSwap(params.clone()),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: is_sol,
         close_output_token_ata: is_sol,
         close_mint_token_ata: false,

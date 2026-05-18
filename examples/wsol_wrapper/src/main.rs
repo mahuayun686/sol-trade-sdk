@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 2: Unwrap half of the WSOL back to SOL using seed account
     println!("\n🔄 Example 2: Unwrapping half of WSOL back to SOL using seed account");
     let unwrap_amount = wrap_amount / 2; // Half of the wrapped amount
-    println!("Unwrapping {} lamports (0.0005 SOL) back to SOL using seed account...", unwrap_amount);
+    println!(
+        "Unwrapping {} lamports (0.0005 SOL) back to SOL using seed account...",
+        unwrap_amount
+    );
 
     match solana_trade.wrap_wsol_to_sol(unwrap_amount).await {
         Ok(signature) => {
@@ -81,7 +84,14 @@ async fn create_solana_trade_client() -> Result<SolanaTrade, Box<dyn std::error:
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)

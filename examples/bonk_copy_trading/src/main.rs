@@ -10,7 +10,10 @@ use sol_trade_sdk::common::{
 use sol_trade_sdk::{
     common::AnyResult,
     swqos::SwqosConfig,
-    trading::{core::params::{BonkParams, DexParamEnum}, factory::DexType},
+    trading::{
+        core::params::{BonkParams, DexParamEnum},
+        factory::DexType,
+    },
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -110,7 +113,14 @@ async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)
@@ -127,14 +137,7 @@ async fn bonk_copy_trade_with_grpc(trade_info: BonkTradeEvent) -> AnyResult<()> 
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = GasFeeStrategy::new();
-    gas_fee_strategy.set_global_fee_strategy(
-        150000,
-        150000,
-        500000,
-        500000,
-        0.001,
-        0.001,
-    );
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
 
     // Buy tokens
     println!("Buying tokens from Bonk...");
@@ -167,7 +170,7 @@ async fn bonk_copy_trade_with_grpc(trade_info: BonkTradeEvent) -> AnyResult<()> 
             trade_info.global_config,
         )),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: false,
         create_mint_ata: true,
@@ -218,7 +221,7 @@ async fn bonk_copy_trade_with_grpc(trade_info: BonkTradeEvent) -> AnyResult<()> 
             trade_info.global_config,
         )),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         with_tip: false,
         durable_nonce: None,
         create_output_token_ata: false,

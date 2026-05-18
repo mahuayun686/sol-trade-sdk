@@ -1,21 +1,226 @@
 //! Parallel executor for multi-SWQOS submit.
+//!
+//! **Hot path (submit):** no lock (OnceCell + lock-free ArrayQueue), no `get_core_ids()`, only Arc clones and queue push.
+//! - **Pool**: Pre-spawned workers (default 18); hot path only enqueues jobs (no per-call tokio::spawn).
+//! - **Dedicated threads** (opt-in via `with_dedicated_sender_threads`): N OS threads run sender work only, optionally pinned to cores.
+//! - **Arc**: Shared data behind `Arc` → clone = refcount increment (no data copy).
+//! - **Refs**: `build_transaction` takes refs only; worker path avoids extra clones.
+//!
+//! **Core affinity & latency:** Each job is assigned a core (round-robin from `effective_core_ids`). When a worker runs a job,
+//! it sets thread affinity to that core. If that core is busy with other work (e.g. node sync, bot logic), SWQOS submit on that
+//! core will compete for CPU and latency can increase. For lowest latency, reserve a subset of cores for SWQOS only via
+//! `with_dedicated_sender_threads(Some(indices))` and avoid running other CPU-heavy work on those core indices.
 
 use anyhow::{anyhow, Result};
 use crossbeam_queue::ArrayQueue;
+use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use solana_hash::Hash;
-use solana_sdk::message::AddressLookupTableAccount;
+use solana_message::AddressLookupTableAccount;
 use solana_sdk::{
     instruction::Instruction, pubkey::Pubkey, signature::Keypair, signature::Signature,
 };
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::{str::FromStr, sync::Arc, time::Instant};
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Notify;
+
+use fnv::FnvHasher;
+
+type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FnvHasher>>;
 
 use crate::{
     common::nonce_cache::DurableNonceInfo,
-    common::{GasFeeStrategy, SolanaRpcClient},
+    common::GasFeeStrategy,
     swqos::{SwqosClient, SwqosType, TradeType},
+    trading::core::params::SenderConcurrencyConfig,
     trading::{common::build_transaction, MiddlewareManager},
 };
+
+/// 与 transaction_pool::PARALLEL_SENDER_COUNT 一致，保证多路 build 不串行
+const SWQOS_POOL_WORKERS: usize = 18;
+const SWQOS_QUEUE_CAP: usize = 128;
+const SWQOS_DEDICATED_DEFAULT_THREADS: usize = 18;
+
+/// Shared across all jobs in one batch; built once, cloned as single Arc per job (minimal hot-path clone).
+struct SwqosSharedContext {
+    payer: Arc<Keypair>,
+    instructions: Arc<Vec<Instruction>>,
+    address_lookup_table_account: Option<AddressLookupTableAccount>,
+    recent_blockhash: Option<Hash>,
+    durable_nonce: Option<DurableNonceInfo>,
+    middleware_manager: Option<Arc<MiddlewareManager>>,
+    protocol_name: &'static str,
+    is_buy: bool,
+    wait_transaction_confirmed: bool,
+    with_tip: bool,
+    collector: Arc<ResultCollector>,
+}
+
+/// One SWQOS submit task; only per-task data + one Arc to shared (reduces hot-path clones).
+struct SwqosJob {
+    shared: Arc<SwqosSharedContext>,
+    tip: f64,
+    unit_limit: u32,
+    unit_price: u64,
+    tip_account: Arc<Pubkey>,
+    swqos_client: Arc<SwqosClient>,
+    swqos_type: SwqosType,
+    core_id: Option<core_affinity::CoreId>,
+    use_affinity: bool,
+}
+
+async fn run_one_swqos_job(job: SwqosJob) {
+    let s = &job.shared;
+    if job.use_affinity {
+        if let Some(cid) = job.core_id {
+            core_affinity::set_for_current(cid);
+        }
+    }
+
+    let tip_amount = if s.with_tip { job.tip } else { 0.0 };
+
+    let transaction = match build_transaction(
+        &s.payer,
+        job.unit_limit,
+        job.unit_price,
+        s.instructions.as_ref(),
+        s.address_lookup_table_account.as_ref(),
+        s.recent_blockhash,
+        s.middleware_manager.as_ref(),
+        s.protocol_name,
+        s.is_buy,
+        job.swqos_type != SwqosType::Default,
+        &job.tip_account,
+        tip_amount,
+        s.durable_nonce.as_ref(),
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            s.collector.submit(TaskResult {
+                success: false,
+                signature: Signature::default(),
+                error: Some(e),
+                swqos_type: job.swqos_type,
+                landed_on_chain: false,
+                submit_done_us: crate::common::clock::now_micros(),
+            });
+            return;
+        }
+    };
+
+    let (success, err, landed_on_chain) = match job
+        .swqos_client
+        .send_transaction(
+            if s.is_buy { TradeType::Buy } else { TradeType::Sell },
+            &transaction,
+            s.wait_transaction_confirmed,
+        )
+        .await
+    {
+        Ok(()) => (true, None, true),
+        Err(e) => {
+            let landed = is_landed_error(&e);
+            (false, Some(e), landed)
+        }
+    };
+
+    let sig = transaction.signatures.first().copied().unwrap_or_default();
+    s.collector.submit(TaskResult {
+        success,
+        signature: sig,
+        error: err,
+        swqos_type: job.swqos_type,
+        landed_on_chain,
+        submit_done_us: crate::common::clock::now_micros(),
+    });
+}
+
+async fn swqos_worker_loop(queue: Arc<ArrayQueue<SwqosJob>>, notify: Arc<Notify>) {
+    loop {
+        if let Some(job) = queue.pop() {
+            run_one_swqos_job(job).await;
+        } else {
+            notify.notified().await;
+        }
+    }
+}
+
+static SWQOS_QUEUE: OnceCell<Arc<ArrayQueue<SwqosJob>>> = OnceCell::new();
+static SWQOS_NOTIFY: OnceCell<Arc<Notify>> = OnceCell::new();
+static SWQOS_WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Dedicated OS-thread sender pool. Queue and notify are in OnceCell so hot path never takes a lock after init.
+static DEDICATED_QUEUE: OnceCell<Arc<ArrayQueue<SwqosJob>>> = OnceCell::new();
+static DEDICATED_NOTIFY: OnceCell<Arc<Notify>> = OnceCell::new();
+/// JoinHandles kept so dedicated threads are not detached; only touched during init under lock.
+static DEDICATED_INIT: Mutex<Option<Vec<std::thread::JoinHandle<()>>>> = Mutex::new(None);
+
+fn ensure_dedicated_pool(
+    sender_thread_cores: Option<&[usize]>,
+    max_sender_concurrency: usize,
+) -> (Arc<ArrayQueue<SwqosJob>>, Arc<Notify>) {
+    if let (Some(q), Some(n)) = (DEDICATED_QUEUE.get(), DEDICATED_NOTIFY.get()) {
+        return (q.clone(), n.clone());
+    }
+    let mut guard = DEDICATED_INIT.lock();
+    if let (Some(q), Some(n)) = (DEDICATED_QUEUE.get(), DEDICATED_NOTIFY.get()) {
+        return (q.clone(), n.clone());
+    }
+    let n = sender_thread_cores
+        .map(|v| v.len().min(max_sender_concurrency))
+        .unwrap_or_else(|| SWQOS_DEDICATED_DEFAULT_THREADS.min(max_sender_concurrency))
+        .min(32)
+        .max(1);
+    let queue = Arc::new(ArrayQueue::new(SWQOS_QUEUE_CAP));
+    let notify = Arc::new(Notify::new());
+    let core_ids: Vec<core_affinity::CoreId> = core_affinity::get_core_ids()
+        .map(|all_ids| {
+            sender_thread_cores
+                .map(|indices| {
+                    indices.iter().take(n).filter_map(|&i| all_ids.get(i).cloned()).collect()
+                })
+                .unwrap_or_else(|| all_ids.into_iter().take(n).collect())
+        })
+        .unwrap_or_default();
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let queue = queue.clone();
+        let notify = notify.clone();
+        let core_id = core_ids.get(i).cloned();
+        let handle = std::thread::spawn(move || {
+            if let Some(cid) = core_id {
+                core_affinity::set_for_current(cid);
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("dedicated sender runtime");
+            rt.block_on(swqos_worker_loop(queue, notify));
+        });
+        handles.push(handle);
+    }
+    let _ = DEDICATED_QUEUE.set(queue.clone());
+    let _ = DEDICATED_NOTIFY.set(notify.clone());
+    *guard = Some(handles);
+    (queue, notify)
+}
+
+fn ensure_swqos_pool(queue: Arc<ArrayQueue<SwqosJob>>, max_sender_concurrency: usize) {
+    if SWQOS_WORKERS_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let n = SWQOS_POOL_WORKERS.min(max_sender_concurrency).max(1);
+    let notify = SWQOS_NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone();
+    for _ in 0..n {
+        tokio::spawn(swqos_worker_loop(queue.clone(), notify.clone()));
+    }
+}
 
 #[repr(align(64))]
 struct TaskResult {
@@ -55,7 +260,7 @@ fn is_landed_error(error: &anyhow::Error) -> bool {
 struct ResultCollector {
     results: Arc<ArrayQueue<TaskResult>>,
     success_flag: Arc<AtomicBool>,
-    landed_failed_flag: Arc<AtomicBool>,  // 🔧 Tx landed on-chain but failed (nonce consumed)
+    landed_failed_flag: Arc<AtomicBool>, // 🔧 Tx landed on-chain but failed (nonce consumed)
     completed_count: Arc<AtomicUsize>,
     total_tasks: usize,
 }
@@ -88,7 +293,9 @@ impl ResultCollector {
         self.completed_count.fetch_add(1, Ordering::Release);
     }
 
-    async fn wait_for_success(&self) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
+    async fn wait_for_success(
+        &self,
+    ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
         let start = Instant::now();
         let timeout = std::time::Duration::from_secs(5);
         let poll_interval = std::time::Duration::from_millis(1000);
@@ -130,7 +337,7 @@ impl ResultCollector {
             }
 
             let completed = self.completed_count.load(Ordering::Acquire);
-                if completed >= self.total_tasks {
+            if completed >= self.total_tasks {
                 let mut signatures = Vec::new();
                 let mut last_error = None;
                 let mut any_success = false;
@@ -158,7 +365,9 @@ impl ResultCollector {
         }
     }
 
-    fn get_first(&self) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
+    fn get_first(
+        &self,
+    ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
         let mut signatures = Vec::new();
         let mut has_success = false;
         let mut last_error = None;
@@ -184,25 +393,45 @@ impl ResultCollector {
 
     /// 等待全部任务完成（不等待链上确认），然后收集并返回所有签名。用于「多路提交」时返回多笔签名。
     /// 轮询间隔 2ms，避免 50ms 间隔在最后一笔返回时多等几十 ms 拉高 submit 耗时。
-    async fn wait_for_all_submitted(&self, timeout_secs: u64) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
+    async fn wait_for_all_submitted(
+        &self,
+        timeout_secs: u64,
+    ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
         let start = Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        let poll_interval = std::time::Duration::from_millis(2);
+        let primary = Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(2);
         while self.completed_count.load(Ordering::Acquire) < self.total_tasks {
-            if start.elapsed() > timeout {
+            if start.elapsed() > primary {
                 break;
             }
             tokio::time::sleep(poll_interval).await;
+        }
+        // 「不等待链上确认」仍会等各 SWQOS 的 HTTP 回包；主循环在收齐或触达 `timeout_secs` 后结束。
+        // 若主窗口到时仍有未回包通道，晚到的 TaskResult 若立刻 drain 会丢签名——仅在该路径上拉长 grace。
+        let all_submitted = self.completed_count.load(Ordering::Acquire) >= self.total_tasks;
+        if all_submitted {
+            // 全数已登记：仅留极短 settle，避免极端情况下最后一笔与计数可见性竞态。
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            while self.completed_count.load(Ordering::Acquire) < self.total_tasks {
+                if start.elapsed() > primary + Duration::from_secs(6) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
         }
         self.get_first()
     }
 }
 
 /// Execute trade on multiple SWQOS clients in parallel; returns success flag, all signatures, and last error.
+///
+/// `sender_config` merges sender_thread_cores, effective_core_ids, max_sender_concurrency (precomputed at SDK init; no get_core_ids on hot path).
 pub async fn execute_parallel(
     swqos_clients: &[Arc<SwqosClient>],
     payer: Arc<Keypair>,
-    rpc: Option<Arc<SolanaRpcClient>>,
     instructions: Vec<Instruction>,
     address_lookup_table_account: Option<AddressLookupTableAccount>,
     recent_blockhash: Option<Hash>,
@@ -213,11 +442,10 @@ pub async fn execute_parallel(
     wait_transaction_confirmed: bool,
     with_tip: bool,
     gas_fee_strategy: GasFeeStrategy,
-    use_core_affinity: bool,
+    use_dedicated_sender_threads: bool,
+    sender_config: SenderConcurrencyConfig,
     check_min_tip: bool,
 ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
-    let _exec_start = Instant::now();
-
     if swqos_clients.is_empty() {
         return Err(anyhow!("swqos_clients is empty"));
     }
@@ -231,48 +459,37 @@ pub async fn execute_parallel(
         return Err(anyhow!("No Rpc Default Swqos configured."));
     }
 
-    let cores = core_affinity::get_core_ids().unwrap_or_default();
     let instructions = Arc::new(instructions);
 
-    // Precompute all valid (client, gas config) combinations
-    let task_configs: Vec<_> = swqos_clients
-        .iter()
-        .enumerate()
-        .filter(|(_, swqos_client)| {
-            with_tip || matches!(swqos_client.get_swqos_type(), SwqosType::Default)
-        })
-        .flat_map(|(i, swqos_client)| {
-            let swqos_type = swqos_client.get_swqos_type();
-            let gas_fee_strategy_configs = gas_fee_strategy.get_strategies(if is_buy {
-                TradeType::Buy
-            } else {
-                TradeType::Sell
-            });
-            let check_tip = with_tip && !matches!(swqos_type, SwqosType::Default) && check_min_tip;
-            let min_tip = if check_tip {
-                swqos_client.min_tip_sol()
-            } else {
-                0.0
-            };
-            gas_fee_strategy_configs
-                .into_iter()
-                .filter(move |config| config.0 == swqos_type)
-                .filter(move |config| {
-                    if check_tip {
-                        if config.2.tip < min_tip && crate::common::sdk_log::sdk_log_enabled() {
-                            println!(
-                                "⚠️ Config filtered: {:?} tip {} is below minimum required {}",
-                                config.0, config.2.tip, min_tip
-                            );
-                        }
-                        config.2.tip >= min_tip
-                    } else {
-                        true
-                    }
-                })
-                .map(move |config| (i, swqos_client.clone(), config))
-        })
-        .collect();
+    // One get_strategies call per batch (avoid N calls in loop).
+    let gas_fee_configs =
+        gas_fee_strategy.get_strategies(if is_buy { TradeType::Buy } else { TradeType::Sell });
+    let mut task_configs = Vec::with_capacity(swqos_clients.len() * 3);
+    for (i, swqos_client) in swqos_clients.iter().enumerate() {
+        let swqos_type = swqos_client.get_swqos_type();
+        if !with_tip && !matches!(swqos_type, SwqosType::Default) {
+            continue;
+        }
+        let check_tip = with_tip && !matches!(swqos_type, SwqosType::Default) && check_min_tip;
+        let min_tip = if check_tip { swqos_client.min_tip_sol() } else { 0.0 };
+        for config in &gas_fee_configs {
+            if config.0 != swqos_type {
+                continue;
+            }
+            if check_tip {
+                if config.2.tip < min_tip && crate::common::sdk_log::sdk_log_enabled() {
+                    println!(
+                        "⚠️ Config filtered: {:?} tip {} is below minimum required {}",
+                        config.0, config.2.tip, min_tip
+                    );
+                }
+                if config.2.tip < min_tip {
+                    continue;
+                }
+            }
+            task_configs.push((i, swqos_client.clone(), *config));
+        }
+    }
 
     if task_configs.is_empty() {
         return Err(anyhow!("No available gas fee strategy configs"));
@@ -282,123 +499,88 @@ pub async fn execute_parallel(
         return Err(anyhow!("Multiple swqos transactions require durable_nonce to be set.",));
     }
 
-    // Task preparation completed
+    // Task preparation completed: one shared context (clone once per batch), then minimal per-task data.
+    let channel_count = task_configs.len().max(1);
+    let collector = Arc::new(ResultCollector::new(channel_count));
+    // 上限最多 5s：单路卡死时才会等满；若所有通道在窗口内回完，主循环会提前结束（不睡满秒数）。
+    let submit_timeout_secs: u64 =
+        (3u64 + (channel_count.min(16) as u64).div_ceil(2).min(6)).clamp(3, 5);
+    let shared = Arc::new(SwqosSharedContext {
+        payer,
+        instructions,
+        address_lookup_table_account,
+        recent_blockhash,
+        durable_nonce,
+        middleware_manager,
+        protocol_name,
+        is_buy,
+        wait_transaction_confirmed,
+        with_tip,
+        collector: collector.clone(),
+    });
 
-    let collector = Arc::new(ResultCollector::new(task_configs.len()));
-    let _spawn_start = Instant::now();
+    let (queue, notify) = if use_dedicated_sender_threads {
+        ensure_dedicated_pool(
+            sender_config.sender_thread_cores.as_ref().map(|a| a.as_slice()),
+            sender_config.max_sender_concurrency,
+        )
+    } else {
+        let q = SWQOS_QUEUE.get_or_init(|| Arc::new(ArrayQueue::new(SWQOS_QUEUE_CAP)));
+        ensure_swqos_pool(q.clone(), sender_config.max_sender_concurrency);
+        (q.clone(), SWQOS_NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone())
+    };
 
-    for (i, swqos_client, gas_fee_strategy_config) in task_configs {
-        let core_id = cores.get(i % cores.len().max(1)).copied();
-        let use_affinity = use_core_affinity;
-        let payer = payer.clone();
-        let instructions = instructions.clone();
-        let middleware_manager = middleware_manager.clone();
-        let swqos_type = swqos_client.get_swqos_type();
-        let tip_account_str = swqos_client.get_tip_account()?;
-        let tip_account = Arc::new(Pubkey::from_str(&tip_account_str).unwrap_or_default());
-        let collector = collector.clone();
-
-        let tip = gas_fee_strategy_config.2.tip;
-        let unit_limit = gas_fee_strategy_config.2.cu_limit;
-        let unit_price = gas_fee_strategy_config.2.cu_price;
-        let rpc = rpc.clone();
-        let durable_nonce = durable_nonce.clone();
-        let address_lookup_table_account = address_lookup_table_account.clone();
-        let recent_blockhash_task = recent_blockhash.clone();
-
-        tokio::spawn(async move {
-            let _task_start = Instant::now();
-            if use_affinity {
-                if let Some(cid) = core_id {
-                    core_affinity::set_for_current(cid);
+    {
+        let effective_core_ids = sender_config.effective_core_ids.as_slice();
+        let core_len = effective_core_ids.len().max(1);
+        let mut tip_cache: FnvHashMap<*const (), Arc<Pubkey>> =
+            FnvHashMap::with_capacity_and_hasher(task_configs.len(), BuildHasherDefault::default());
+        for (i, swqos_client, gas_fee_strategy_config) in task_configs {
+            let core_id = effective_core_ids.get(i % core_len).copied();
+            let swqos_type = swqos_client.get_swqos_type();
+            let key = Arc::as_ptr(&swqos_client) as *const ();
+            let tip_account = match tip_cache.get(&key) {
+                Some(t) => t.clone(),
+                None => {
+                    let s = swqos_client.get_tip_account()?;
+                    let tip = Arc::new(Pubkey::from_str(&s).unwrap_or_default());
+                    tip_cache.insert(key, tip.clone());
+                    tip
                 }
-            }
-
-            let tip_amount = if with_tip { tip } else { 0.0 };
-
-            let _build_start = Instant::now();
-            let transaction = match build_transaction(
-                payer,
-                rpc,
+            };
+            let (tip, unit_limit, unit_price) = (
+                gas_fee_strategy_config.2.tip,
+                gas_fee_strategy_config.2.cu_limit,
+                gas_fee_strategy_config.2.cu_price,
+            );
+            let job = SwqosJob {
+                shared: shared.clone(),
+                tip,
                 unit_limit,
                 unit_price,
-                instructions.as_ref(),
-                address_lookup_table_account,
-                recent_blockhash_task,
-                middleware_manager,
-                protocol_name,
-                is_buy,
-                swqos_type != SwqosType::Default,
-                &tip_account,
-                tip_amount,
-                durable_nonce,
-            )
-            .await
-            {
-                Ok(tx) => tx,
-                Err(e) => {
-                    // Build transaction failed
-                    collector.submit(TaskResult {
-                        success: false,
-                        signature: Signature::default(),
-                        error: Some(e),
-                        swqos_type,
-                        landed_on_chain: false,
-                        submit_done_us: crate::common::clock::now_micros(),
-                    });
-                    return;
-                }
-            };
-
-            // Transaction built
-
-            let _send_start = Instant::now();
-            let mut err: Option<anyhow::Error> = None;
-            #[allow(unused_assignments)]
-            let mut landed_on_chain = false;
-            let success = match swqos_client
-                .send_transaction(
-                    if is_buy { TradeType::Buy } else { TradeType::Sell },
-                    &transaction,
-                    wait_transaction_confirmed,
-                )
-                .await
-            {
-                Ok(()) => {
-                    landed_on_chain = true;  // Success means tx confirmed on-chain
-                    true
-                }
-                Err(e) => {
-                    // Check if this error indicates the tx landed but failed (e.g., ExceededSlippage)
-                    landed_on_chain = is_landed_error(&e);
-                    err = Some(e);
-                    // Send transaction failed
-                    false
-                }
-            };
-
-            // Transaction sent: always submit a result so collector never has "no result" for this task.
-            // If transaction has no signatures (malformed), submit with default signature and success=false.
-            let sig = transaction.signatures.first().copied().unwrap_or_default();
-            collector.submit(TaskResult {
-                success,
-                signature: sig,
-                error: err,
+                tip_account,
+                swqos_client,
                 swqos_type,
-                landed_on_chain,
-                submit_done_us: crate::common::clock::now_micros(),
-            });
-        });
+                core_id,
+                use_affinity: !effective_core_ids.is_empty(),
+            };
+            let _ = queue.push(job);
+        }
     }
 
-    // All tasks spawned
+    notify.notify_waiters();
+
+    // All jobs enqueued (no spawn on hot path)
 
     if !wait_transaction_confirmed {
-        const SUBMIT_TIMEOUT_SECS: u64 = 30;
-        let ret = collector
-            .wait_for_all_submitted(SUBMIT_TIMEOUT_SECS)
-            .await
-            .unwrap_or((false, vec![], Some(anyhow!("No SWQOS result within {}s", SUBMIT_TIMEOUT_SECS)), vec![]));
+        // submit_timeout_secs 为「等齐各 SWQOS HTTP 应答」的上限；收齐后会立刻进入短 settle，不会睡满整段秒数。
+        // `wait_for_all_submitted` 仅在未收齐时追加长 grace，避免过早 drain 丢晚到签名。
+        let ret = collector.wait_for_all_submitted(submit_timeout_secs).await.unwrap_or((
+            false,
+            vec![],
+            Some(anyhow!("No SWQOS result within grace window (primary {}s)", submit_timeout_secs)),
+            vec![],
+        ));
         let (success, signatures, last_error, submit_timings) = ret;
         return Ok((success, signatures, last_error, submit_timings));
     }

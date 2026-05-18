@@ -3,7 +3,8 @@ use sol_trade_sdk::{
     common::{AnyResult, TradeConfig},
     swqos::SwqosConfig,
     trading::{
-        core::params::{PumpSwapParams, DexParamEnum}, factory::DexType,
+        core::params::{DexParamEnum, PumpSwapParams},
+        factory::DexType,
         InstructionMiddleware, MiddlewareManager,
     },
     SolanaTrade, TradeTokenType,
@@ -30,7 +31,7 @@ impl InstructionMiddleware for CustomMiddleware {
     fn process_protocol_instructions(
         &self,
         protocol_instructions: Vec<Instruction>,
-        _protocol_name: String,
+        _protocol_name: &str,
         _is_buy: bool,
     ) -> Result<Vec<Instruction>> {
         // do anything you want here
@@ -41,7 +42,7 @@ impl InstructionMiddleware for CustomMiddleware {
     fn process_full_instructions(
         &self,
         full_instructions: Vec<Instruction>,
-        _protocol_name: String,
+        _protocol_name: &str,
         _is_buy: bool,
     ) -> Result<Vec<Instruction>> {
         // do anything you want here
@@ -62,7 +63,14 @@ async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
     println!("✅ SolanaTrade client initialized successfully!");
     Ok(solana_trade)
@@ -91,10 +99,11 @@ async fn test_middleware() -> AnyResult<()> {
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::PumpSwap(
-            PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_address).await?,
+            PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_address)
+                .await?,
         ),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: true,
         create_mint_ata: true,

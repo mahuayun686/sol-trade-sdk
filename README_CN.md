@@ -39,6 +39,12 @@
     <a href="https://discord.gg/vuazbGkqQE">Discord</a>
 </p>
 
+> ☕ **支持本项目**
+>
+> 本 SDK 完全免费且开源。但维护和持续更新需要消耗大量 AI 算力与 Token。如果这个 SDK 对您的开发有帮助，欢迎每月捐赠任意数量的 SOL，您的支持将帮助这个项目持续运行！
+>
+> **捐赠钱包：** `6oW7AXz1yRb57pYSxysuXnMs2aR1ha5rzGzReZ1MjPV8`
+
 ## 📋 目录
 
 - [✨ 项目特性](#-项目特性)
@@ -48,10 +54,12 @@
   - [⚡ 交易参数](#-交易参数)
   - [📊 使用示例汇总表格](#-使用示例汇总表格)
   - [⚙️ SWQoS 服务配置说明](#️-swqos-服务配置说明)
+  - [Astralane（Binary / Plain / QUIC）](#astralanebinary--plain--quic)
   - [🔧 中间件系统说明](#-中间件系统说明)
   - [🔍 地址查找表](#-地址查找表)
   - [🔍 Nonce 缓存](#-nonce-缓存)
 - [💰 Cashback 支持（PumpFun / PumpSwap）](#-cashback-支持pumpfun--pumpswap)
+  - [Pump.fun 常见链上错误与排错（文档）](docs/PUMP_ERRORS_AND_TROUBLESHOOTING_CN.md)
 - [🛡️ MEV 保护服务](#️-mev-保护服务)
 - [📁 项目结构](#-项目结构)
 - [📄 许可证](#-许可证)
@@ -60,15 +68,26 @@
 
 ---
 
+## 📦 SDK 版本
+
+本 SDK 提供多种语言版本：
+
+| 语言 | 仓库 | 描述 |
+|------|------|------|
+| **Rust** | [sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk) | 超低延迟，零拷贝优化 |
+| **Node.js** | [sol-trade-sdk-nodejs](https://github.com/0xfnzero/sol-trade-sdk-nodejs) | TypeScript/JavaScript，Node.js 支持 |
+| **Python** | [sol-trade-sdk-python](https://github.com/0xfnzero/sol-trade-sdk-python) | 原生 async/await 支持 |
+| **Go** | [sol-trade-sdk-golang](https://github.com/0xfnzero/sol-trade-sdk-golang) | 并发安全，goroutine 支持 |
+
 ## ✨ 项目特性
 
-1. **PumpFun 交易**: 支持`购买`、`卖出`功能
+1. **PumpFun 交易**: 支持 `buy`、`sell`、`buy_exact_sol_in` 以及全新的统一化 `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` 指令（SOL + USDC）
 2. **PumpSwap 交易**: 支持 PumpSwap 池的交易操作
 3. **Bonk 交易**: 支持 Bonk 的交易操作
 4. **Raydium CPMM 交易**: 支持 Raydium CPMM (Concentrated Pool Market Maker) 的交易操作
 5. **Raydium AMM V4 交易**: 支持 Raydium AMM V4 (Automated Market Maker) 的交易操作
 6. **Meteora DAMM V2 交易**: 支持 Meteora DAMM V2 (Dynamic AMM) 的交易操作
-7. **多种 MEV 保护**: 支持 Jito、Nextblock、ZeroSlot、Temporal、Bloxroute、FlashBlock、BlockRazor、Node1、Astralane 等服务
+7. **多种 MEV 保护**: 支持 Jito、Temporal、FlashBlock、BlockRazor、Astralane、SpeedLanding 等服务
 8. **并发交易**: 同时使用多个 MEV 服务发送交易，最快的成功，其他失败
 9. **统一交易接口**: 使用统一的交易协议枚举进行交易操作
 10. **中间件系统**: 支持自定义指令中间件，可在交易执行前对指令进行修改、添加或移除
@@ -89,14 +108,14 @@ git clone https://github.com/0xfnzero/sol-trade-sdk
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "3.5.7" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.9" }
 ```
 
 ### 使用 crates.io
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = "3.5.7"
+sol-trade-sdk = "4.0.9"
 ```
 
 ## 🛠️ 使用示例
@@ -118,14 +137,22 @@ let commitment = CommitmentConfig::processed();
 let swqos_configs: Vec<SwqosConfig> = vec![
     SwqosConfig::Default(rpc_url.clone()),
     SwqosConfig::Jito("your uuid".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Bloxroute("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::Temporal("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::FlashBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::BlockRazor("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    // Astralane：第4个参数为 AstralaneTransport — Binary（默认）、Plain（/iris）或 Quic
+    SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None), // Binary /irisb
+    SwqosConfig::SpeedLanding("your api_token".to_string(), SwqosRegion::Frankfurt, None),
 ];
 // 创建 TradeConfig 实例
-let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
-
-// 可选：自定义 WSOL ATA 与 Seed 优化
-// let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment)
-//     .with_wsol_ata_config(true, true);  // create_wsol_ata_on_startup, use_seed_optimize
+let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+    // .create_wsol_ata_on_startup(true)  // 默认: true  - 初始化时检查并创建 WSOL ATA
+    // .use_seed_optimize(true)            // 默认: true  - ATA 操作启用 seed 优化
+    // .log_enabled(true)                  // 默认: true  - SDK 计时 / SWQOS 日志
+    // .check_min_tip(false)               // 默认: false - 过滤低于最低小费的 SWQOS
+    // .swqos_cores_from_end(false)        // 默认: false - 将 SWQOS 绑定到末尾 N 个 CPU 核心
+    // .mev_protection(false)              // 默认: false - MEV（Astralane QUIC :9000 或 HTTP mev-protect / BlockRazor）
+    .build();
 
 // 创建 TradingClient
 let client = TradingClient::new(Arc::new(payer), trade_config).await;
@@ -242,7 +269,7 @@ let jito_config = SwqosConfig::Jito(
 );
 
 // 使用默认区域端点（第三个参数为 None）
-let bloxroute_config = SwqosConfig::Bloxroute(
+let temporal_config = SwqosConfig::Temporal(
     "your_api_token".to_string(),
     SwqosRegion::NewYork, // 将使用该区域的默认端点
     None // 没有自定义 URL，使用 SwqosRegion
@@ -255,6 +282,29 @@ let bloxroute_config = SwqosConfig::Bloxroute(
 - 这提供了最大的灵活性，同时保持向后兼容性
 
 当使用多个MEV服务时，需要使用`Durable Nonce`。你需要使用`fetch_nonce_info`函数获取最新的`nonce`值，并在交易的时候将`durable_nonce`填入交易参数。
+
+#### Astralane（Binary / Plain / QUIC）
+
+Astralane 支持 **Binary** HTTP（`/irisb`）、**Plain** HTTP（`/iris`）与 **QUIC**（`host:7000`，全局 `mev_protection` 为 true 时用 `:9000`）。第四个参数：`Some(AstralaneTransport::Plain)`、`Some(AstralaneTransport::Quic)`，或 `None` 表示 **Binary**（默认）。全局 `mev_protection` 会在 HTTP 上附加 `mev-protect=true`，或为 QUIC 选择 9000 端口。
+
+```rust
+use sol_trade_sdk::{SwqosConfig, SwqosRegion, AstralaneTransport};
+
+let swqos_configs: Vec<SwqosConfig> = vec![
+    SwqosConfig::Default(rpc_url.clone()),
+    SwqosConfig::Astralane(
+        "your_astralane_api_key".to_string(),
+        SwqosRegion::Frankfurt,
+        None,
+        Some(AstralaneTransport::Quic),
+    ),
+];
+// 然后照常使用 swqos_configs 创建 TradeConfig / TradingClient
+```
+
+- **Binary**（默认）：`None` 或 `Some(AstralaneTransport::Binary)` — `/irisb`，bincode 正文。
+- **Plain**：`Some(AstralaneTransport::Plain)` — `/iris`。
+- **QUIC**：`Some(AstralaneTransport::Quic)` — 按区域的 `host:7000` / `:9000`（MEV）；同一 API key。
 
 ---
 
@@ -288,18 +338,75 @@ PumpFun 与 PumpSwap 支持**返现（Cashback）**：部分手续费可返还�
 - **pumpfun_copy_trading**、**pumpfun_sniper_trading** 示例使用 sol-parser-sdk 订阅 gRPC 事件，并在构造参数时传入 `e.is_cashback_coin`。
 - **领取返现**：使用 `client.claim_cashback_pumpfun()` 和 `client.claim_cashback_pumpswap(...)` 领取累计的返现。
 
+#### PumpFun：常见错误与排错思路
+
+实盘集成时若遇 **Anchor 2006、`NotAuthorized`(6000)、Token program 不匹配、6020/6042** 等，请参阅专门文档：**[Pump.fun 常见链上错误与处理思路（中文）](docs/PUMP_ERRORS_AND_TROUBLESHOOTING_CN.md)**。
+
+#### PumpFun：Creator Rewards Sharing（creator_vault）
+
+部分 PumpFun 代币启用了 **Creator Rewards Sharing**，链上 `creator_vault` 可能与默认推导结果不同。若在**卖出**时复用**买入**时缓存的 params，可能触发程序错误 **2006（seeds constraint violated）**。建议：
+
+- **来自 gRPC/事件（无需 RPC）**：`creator` 与 `creator_vault` 均可从解析后的事件中直接拿到：
+  - **sol-parser-sdk**：推送前会调用 `fill_trade_accounts`，从 buy/sell 指令账户补全 `creator_vault`（buy 索引 9，sell 索引 8）；`creator` 来自 TradeEvent 日志。用 `PumpFunParams::from_trade(..., e.creator, e.creator_vault, ...)` 或 `from_dev_trade(..., e.creator, e.creator_vault, ...)` 即可。
+  - **solana-streamer**：指令解析时从 accounts[9]（buy）/ accounts[8]（sell）写入 `creator_vault`；`creator` 来自合并后的 CPI TradeEvent 日志。同样用事件的 `e.creator`、`e.creator_vault` 调用 `from_trade` / `from_dev_trade`。
+- **RPC 后覆盖**：若通过 `PumpFunParams::from_mint_by_rpc` 得到 params，之后又从 gRPC 拿到更新的 `creator_vault`，在卖出前对 params 调用 `.with_creator_vault(latest_creator_vault)`。
+
+SDK 不会在每次卖出时通过 RPC 拉取 creator_vault（以避免延迟）；请从 gRPC/事件中传入最新 vault。
+
+#### PumpSwap：从事件拿 coin_creator_vault（无需 RPC）
+
+**PumpSwap**（Pump AMM）的 buy/sell 指令需要 `coin_creator_vault_ata` 与 `coin_creator_vault_authority`，二者均可从解析事件中拿到，无需 RPC：
+
+- **sol-parser-sdk**：指令解析从账户 17、18 写入；若事件来自日志，账户填充器也会从指令补全。用 `PumpSwapParams::from_trade(..., e.coin_creator_vault_ata, e.coin_creator_vault_authority, ...)` 即可。
+- **solana-streamer**：指令解析从 `accounts.get(17)`、`accounts.get(18)` 写入。同样用事件的 `coin_creator_vault_ata`、`coin_creator_vault_authority` 调用 `from_trade`。
+
+### Pump.fun Bonding Curve v2（buy_v2 / sell_v2 / buy_exact_quote_in_v2）
+
+Pump.fun 已升级 Bonding Curve 合约，推出**统一化 v2 指令**，通过固定账户布局同时支持 SOL 和 USDC 配对币。旧版 `buy`/`sell`/`buy_exact_sol_in` 仍可用于 SOL 配对币，且保持为默认选项。
+
+**v2 指令关键变化：**
+- 新增 `quote_mint` 参数 — SOL 配对传包装 SOL（`So11111111111111111111111111111111111111112`），USDC 配对传 USDC mint
+- 27 个固定账户（buy）/ 26 个固定账户（sell）— **无可选账户**
+- `buyback_fee_recipient`、`sharing_config` 和 6 个 `associated_quote_*` ATA 变为强制账户
+- SOL 配对币的报价和成本与旧版一致，无额外开销
+
+**使用方式：**
+
+设置 `PumpFunParams` 的 `quote_mint` 即可，SDK 会自动切换到 v2 discriminator 和新账户布局：
+
+```rust
+use sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+use sol_trade_sdk::constants::USDC_TOKEN_ACCOUNT;
+
+// SOL 配对币 — 传包装 SOL mint
+let params = PumpFunParams::from_trade(/* ... */)
+    .with_quote_mint(WSOL_TOKEN_ACCOUNT);
+
+// USDC 配对币（即将开放 — 必须使用 v2）
+let params = PumpFunParams::from_trade(/* ... */)
+    .with_quote_mint(USDC_TOKEN_ACCOUNT);
+
+// 之后正常交易
+client.buy(buy_params).await?;
+client.sell(sell_params).await?;
+```
+
+| quote_mint | use_v2_ix | 实际使用的指令 | 说明 |
+|-----------|-------------|---------|------|
+| 未设置（默认） | `false` | 旧版 `buy`/`sell`/`buy_exact_sol_in` | 向后兼容，仅 SOL |
+| `WSOL_TOKEN_ACCOUNT` | `true` | `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` | SOL 配对，统一布局 |
+| `USDC_TOKEN_ACCOUNT` | `true` | `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` | USDC 配对（必须使用 v2） |
+
 ## 🛡️ MEV 保护服务
 
 可以通过官网申请密钥：[社区官网](https://fnzero.dev/swqos)
 
 - **Jito**: 高性能区块空间
-- **ZeroSlot**: 零延迟交易
 - **Temporal**: 时间敏感交易
-- **Bloxroute**: 区块链网络加速
-- **FlashBlock**: 高速交易执行，支持 API 密钥认证 - [官方文档](https://doc.flashblock.trade/)
-- **BlockRazor**: 高速交易执行，支持 API 密钥认证 - [官方文档](https://blockrazor.gitbook.io/blockrazor/)
-- **Node1**: 高速交易执行，支持 API 密钥认证 - [官方文档](https://node1.me/docs.html)
-- **Astralane**: 高速交易执行，支持 API 密钥认证
+- **FlashBlock**: 高速交易执行，支持 API 密钥认证
+- **BlockRazor**: 高速交易执行，支持 API 密钥认证
+- **Astralane**: 区块链网络加速（Binary/Plain HTTP 与 QUIC）
+- **SpeedLanding**: 高速交易执行，支持 API 密钥认证
 
 ## 📁 项目结构
 
@@ -339,4 +446,3 @@ MIT 许可证
 3. 注意滑点设置避免交易失败
 4. 监控余额和交易费用
 5. 遵循相关法律法规
-

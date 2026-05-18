@@ -6,9 +6,11 @@ use quinn::{
     TransportConfig,
 };
 use rand::seq::IndexedRandom as _;
+use rcgen::{CertificateParams, KeyPair as RcgenKeyPair};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use solana_client::rpc_client::SerializableTransaction;
+use solana_sdk::signer::Signer;
 use solana_sdk::{signature::Keypair, transaction::VersionedTransaction};
-use solana_tls_utils::{new_dummy_x509_certificate, SkipServerVerification};
 use std::time::Instant;
 use std::{
     net::{SocketAddr, ToSocketAddrs as _},
@@ -24,6 +26,66 @@ use crate::{
     constants::swqos::SOYAS_TIP_ACCOUNTS,
     swqos::{SwqosType, TradeType},
 };
+
+// Skip server verification implementation
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+/// TLS 客户端证书：ECDSA P-256 + CN=钱包公钥（与 Speedlanding / Astralane QUIC 策略一致）。
+fn generate_client_tls_credentials(
+    keypair: &Keypair,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let tls_key = RcgenKeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let mut cert_params = CertificateParams::new(vec![])?;
+    cert_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, rcgen::DnValue::Utf8String(keypair.pubkey().to_string()));
+    let cert = cert_params.self_signed(&tls_key)?;
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(tls_key.serialize_der()));
+    Ok((cert_der, key_der))
+}
 
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 const SOYAS_SERVER: &str = "soyas-landing";
@@ -42,8 +104,13 @@ pub struct SoyasClient {
 impl SoyasClient {
     pub async fn new(rpc_url: String, endpoint_string: String, api_key: String) -> Result<Self> {
         let rpc_client = SolanaRpcClient::new(rpc_url);
-        let keypair = Keypair::from_base58_string(&api_key);
-        let (cert, key) = new_dummy_x509_certificate(&keypair);
+        let keypair_bytes = bs58::decode(api_key.trim()).into_vec().map_err(|e| {
+            anyhow::anyhow!("Soyas api_token base58 解码失败（QUIC mTLS 用）: {}", e)
+        })?;
+        let keypair = Keypair::try_from(keypair_bytes.as_slice()).map_err(|e| {
+            anyhow::anyhow!("Soyas api_token 无法解析为 Solana keypair（QUIC mTLS 用）: {}", e)
+        })?;
+        let (cert, key) = generate_client_tls_credentials(&keypair)?;
         let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -109,25 +176,57 @@ impl SwqosClientTrait for SoyasClient {
         let serialized_tx = bincode::serialize(transaction)?;
         let connection = self.connection.load_full();
         if Self::try_send_bytes(&connection, &serialized_tx).await.is_err() {
-            eprintln!(" [soyas] {} submission failed, reconnecting", trade_type);
+            if crate::common::sdk_log::sdk_log_enabled() {
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "Soyas",
+                    trade_type,
+                    start_time.elapsed(),
+                    "reconnecting",
+                );
+            }
             self.reconnect().await?;
             let connection = self.connection.load_full();
             if let Err(e) = Self::try_send_bytes(&connection, &serialized_tx).await {
-                eprintln!(" [soyas] {} submission failed: {:?}", trade_type, e);
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "Soyas",
+                        trade_type,
+                        start_time.elapsed(),
+                        &e,
+                    );
+                }
                 return Err(e.into());
             }
         }
+        if crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_submitted("Soyas", trade_type, start_time.elapsed());
+        }
+        let start_time = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, *signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [soyas] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    println!(" signature: {:?}", signature);
+                    println!(
+                        " [{:width$}] {} confirmation failed: {:?}",
+                        "Soyas",
+                        trade_type,
+                        start_time.elapsed(),
+                        width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+                    );
+                }
                 return Err(e);
             }
         }
-        if wait_confirmation {
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
             println!(" signature: {:?}", signature);
-            println!(" [soyas] {} confirmed: {:?}", trade_type, start_time.elapsed());
+            println!(
+                " [{:width$}] {} confirmed: {:?}",
+                "Soyas",
+                trade_type,
+                start_time.elapsed(),
+                width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+            );
         }
         Ok(())
     }

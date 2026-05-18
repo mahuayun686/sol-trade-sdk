@@ -1,5 +1,7 @@
-
-use crate::swqos::common::{default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode, FormatBase64VersionedTransaction};
+use crate::swqos::common::{
+    default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode,
+    FormatBase64VersionedTransaction,
+};
 use rand::seq::IndexedRandom;
 use reqwest::Client;
 use serde_json::json;
@@ -7,13 +9,12 @@ use std::{sync::Arc, time::Instant};
 
 use solana_transaction_status::UiTransactionEncoding;
 
+use crate::swqos::SwqosClientTrait;
+use crate::swqos::{SwqosType, TradeType};
 use anyhow::Result;
 use solana_sdk::transaction::VersionedTransaction;
-use crate::swqos::{SwqosType, TradeType};
-use crate::swqos::SwqosClientTrait;
 
 use crate::{common::SolanaRpcClient, constants::swqos::JITO_TIP_ACCOUNTS};
-
 
 pub struct JitoClient {
     pub endpoint: String,
@@ -24,11 +25,21 @@ pub struct JitoClient {
 
 #[async_trait::async_trait]
 impl SwqosClientTrait for JitoClient {
-    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transaction_impl(trade_type, transaction, wait_confirmation).await
     }
 
-    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+    async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transactions_impl(trade_type, transactions, wait_confirmation).await
     }
 
@@ -52,9 +63,15 @@ impl JitoClient {
         Self { rpc_client: Arc::new(rpc_client), endpoint, auth_token, http_client }
     }
 
-    pub async fn send_transaction_impl(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transaction_impl(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         let start_time = Instant::now();
-        let (content, signature) = serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
+        let (content, signature) =
+            serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
 
         let request_body = serde_json::to_string(&json!({
             "id": 1,
@@ -76,8 +93,7 @@ impl JitoClient {
         let response = if self.auth_token.is_empty() {
             self.http_client.post(&endpoint)
         } else {
-            self.http_client.post(&endpoint)
-                .header("x-jito-auth", &self.auth_token)
+            self.http_client.post(&endpoint).header("x-jito-auth", &self.auth_token)
         };
         let response_text = response
             .body(request_body)
@@ -89,12 +105,26 @@ impl JitoClient {
 
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("result").is_some() {
-                println!(" [jito] {} submitted: {:?}", trade_type, start_time.elapsed());
+                crate::common::sdk_log::log_swqos_submitted(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                );
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [jito] {} submission failed: {:?}", trade_type, _error);
+                eprintln!(
+                    " [jito] {} submission failed after {:?}: {:?}",
+                    trade_type,
+                    start_time.elapsed(),
+                    _error
+                );
             }
         } else {
-            eprintln!(" [jito] {} submission failed: {:?}", trade_type, response_text);
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "jito",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
+            );
         }
 
         let start_time: Instant = Instant::now();
@@ -102,21 +132,39 @@ impl JitoClient {
             Ok(_) => (),
             Err(e) => {
                 println!(" signature: {:?}", signature);
-                println!(" [jito] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                println!(
+                    " [{:width$}] {} confirmation failed: {:?}",
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                    width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+                );
                 return Err(e);
-            },
+            }
         }
         if wait_confirmation {
             println!(" signature: {:?}", signature);
-            println!(" [jito] {} confirmed: {:?}", trade_type, start_time.elapsed());
+            println!(
+                " [{:width$}] {} confirmed: {:?}",
+                "jito",
+                trade_type,
+                start_time.elapsed(),
+                width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+            );
         }
 
         Ok(())
     }
 
-    pub async fn send_transactions_impl(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, _wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transactions_impl(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        _wait_confirmation: bool,
+    ) -> Result<()> {
         let start_time = Instant::now();
-        let txs_base64 = transactions.iter().map(|tx| tx.to_base64_string()).collect::<Vec<String>>();
+        let txs_base64 =
+            transactions.iter().map(|tx| tx.to_base64_string()).collect::<Vec<String>>();
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "sendBundle",
@@ -135,8 +183,7 @@ impl JitoClient {
         let response = if self.auth_token.is_empty() {
             self.http_client.post(&endpoint)
         } else {
-            self.http_client.post(&endpoint)
-                .header("x-jito-auth", &self.auth_token)
+            self.http_client.post(&endpoint).header("x-jito-auth", &self.auth_token)
         };
         let response_text = response
             .body(body.to_string())
@@ -150,7 +197,12 @@ impl JitoClient {
             if response_json.get("result").is_some() {
                 println!(" jito {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" jito {} submission failed: {:?}", trade_type, _error);
+                eprintln!(
+                    " jito {} submission failed after {:?}: {:?}",
+                    trade_type,
+                    start_time.elapsed(),
+                    _error
+                );
             }
         }
 

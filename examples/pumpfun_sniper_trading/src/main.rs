@@ -3,7 +3,10 @@
 //! 监听创建者首次买入（Create 后同笔/首笔 Buy，is_created_buy == true），
 //! 用事件参数（含 is_cashback_coin）构造 from_dev_trade 并执行一次买+卖。
 
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use sol_parser_sdk::grpc::{
     AccountFilter, ClientConfig, EventType, EventTypeFilter, OrderMode, Protocol,
@@ -16,7 +19,10 @@ use sol_trade_sdk::TradeTokenType;
 use sol_trade_sdk::{
     common::AnyResult,
     swqos::SwqosConfig,
-    trading::{core::params::{PumpFunParams, DexParamEnum}, factory::DexType},
+    trading::{
+        core::params::{DexParamEnum, PumpFunParams},
+        factory::DexType,
+    },
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -94,16 +100,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
-    let trade_config = TradeConfig::new(rpc_url, swqos_configs, commitment);
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
     Ok(SolanaTrade::new(Arc::new(payer), trade_config).await)
 }
 
-async fn pumpfun_sniper_trade(
-    e: sol_parser_sdk::core::events::PumpFunTradeEvent,
-) -> AnyResult<()> {
+async fn pumpfun_sniper_trade(e: sol_parser_sdk::core::events::PumpFunTradeEvent) -> AnyResult<()> {
     let client = create_solana_trade_client().await?;
     let mint_pubkey = e.mint;
     let slippage_basis_points = Some(300u64);
@@ -135,9 +147,10 @@ async fn pumpfun_sniper_trade(
             e.fee_recipient,
             e.token_program,
             e.is_cashback_coin,
+            Some(e.mayhem_mode),
         )),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_input_token_ata: true,
         close_input_token_ata: true,
         create_mint_ata: true,
@@ -178,9 +191,10 @@ async fn pumpfun_sniper_trade(
             e.fee_recipient,
             e.token_program,
             e.is_cashback_coin,
+            Some(e.mayhem_mode),
         )),
         address_lookup_table_account: None,
-        wait_transaction_confirmed: true,
+        wait_tx_confirmed: true,
         create_output_token_ata: true,
         close_output_token_ata: true,
         close_mint_token_ata: false,
